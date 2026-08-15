@@ -1,0 +1,27 @@
+# --- OS / editor junk ---
+.DS_Store
+*.swp
+*.pem
+
+# --- Python (backend) ---
+backend/.venv/
+backend/venv/
+__pycache__/
+*.pyc
+backend/.env
+backend/instance/
+*.sqlite3
+spineguard.db
+*_auth.db
+
+# --- Node / Next (frontend) ---
+node_modules/
+frontend/.next/
+frontend/out/
+frontend/build/
+*.tsbuildinfo
+
+# --- local env files ---
+.env
+.env.local
+frontend/.env.local

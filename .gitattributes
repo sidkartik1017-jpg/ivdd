@@ -1,0 +1,5 @@
+# Never apply line-ending conversion to binary model files — that is what
+# corrupted the original ivdd_best_model.pkl (CRLF<->LF mangling).
+*.pkl binary
+*.pickle binary
+*.joblib binary

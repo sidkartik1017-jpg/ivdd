@@ -1,0 +1,17 @@
+# Runs the Flask API. By default it uses a local SQLite file inside the
+# container. To use your Neon.tech Postgres, set DATABASE_URL in backend/.env
+# (or export it) before `docker compose up`.
+services:
+  api:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    ports:
+      - "5001:5001"
+    env_file:
+      - path: backend/.env
+        required: false
+    environment:
+      # These win over .env if set here; left blank so .env drives them.
+      MODEL_PATH: /app/ivdd_best_model.pkl
+    restart: unless-stopped
