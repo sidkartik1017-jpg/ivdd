@@ -39,6 +39,36 @@ FEATURE_ORDER = [
     "sex_M",
 ]
 
+# Median of each feature over the training set (disc_scored.csv, n=700).
+# Used to fill fields the user left blank: a 0.0 fill sits far outside every
+# feature's observed range, which drops every such case into the same forest
+# leaf and pins the gauge to one constant value.
+FEATURE_MEDIANS = {
+    "disc_height_index": 0.5454,
+    "t2_signal_score": 0.4009,
+    "texture_entropy": 1.9599,
+    "bulge_prob": 0.7998,
+    "endplate_proxy": 1.4746,
+    "CDDY_FGF4_CFA12_copies": 1.0,
+    "breed_genetic_prior": 0.7,
+    "age_months": 67.5,
+    "weight_kg": 11.75,
+    "sex_M": 0.0,
+}
+
+# The measured inputs that actually carry signal. None of the clinical answers
+# (breed, symptoms, neuro grade, onset...) are model features, so when these are
+# blank the model has nothing to go on and only the heuristic can differentiate.
+BIOMARKER_FEATURES = [
+    "disc_height_index",
+    "t2_signal_score",
+    "texture_entropy",
+    "bulge_prob",
+    "endplate_proxy",
+    "CDDY_FGF4_CFA12_copies",
+    "breed_genetic_prior",
+]
+
 # Ordinal risk "centre" of each tier on the dataset's 0..1 overall_risk scale
 # (from the per-tier means), used to turn class probabilities into a single
 # gauge percentage for the UI.
@@ -88,6 +118,17 @@ def _f(value, default=0.0):
         return default
 
 
+def _present(value) -> bool:
+    """True when the form actually carried a usable number for this field."""
+    if value is None or value == "":
+        return False
+    try:
+        float(value)
+    except (TypeError, ValueError):
+        return False
+    return True
+
+
 def _class_to_level(cls) -> str | None:
     k = str(cls).lower()
     if "high" in k:
@@ -126,34 +167,56 @@ class Predictor:
                         self.model_path, exc)
 
     # -- feature construction (must match FEATURE_ORDER) ----------------------
-    def _build_features(self, form: dict) -> list:
+    def _build_features(self, form: dict) -> tuple[list, float]:
+        """Build the model vector, filling blanks with the training median, and
+        report the fraction of BIOMARKER_FEATURES the caller actually supplied."""
         sex_raw = str(form.get("sex") or "")
-        sex_m = 1.0 if sex_raw[:4].lower() == "male" else 0.0
-        feats = {
-            "disc_height_index": _f(form.get("discHeightIndex")),
-            "t2_signal_score": _f(form.get("t2SignalScore")),
-            "texture_entropy": _f(form.get("textureEntropy")),
-            "bulge_prob": _f(form.get("bulgeProb")),
-            "endplate_proxy": _f(form.get("endplateProxy")),
-            "CDDY_FGF4_CFA12_copies": _f(form.get("cddyFgf4Cfa12Copies")),
-            "breed_genetic_prior": _f(form.get("breedGeneticPrior")),
-            "age_months": _f(form.get("ageMonths")),
-            "weight_kg": _f(form.get("weightKg")),
-            "sex_M": sex_m,
+        raw = {
+            "disc_height_index": form.get("discHeightIndex"),
+            "t2_signal_score": form.get("t2SignalScore"),
+            "texture_entropy": form.get("textureEntropy"),
+            "bulge_prob": form.get("bulgeProb"),
+            "endplate_proxy": form.get("endplateProxy"),
+            "CDDY_FGF4_CFA12_copies": form.get("cddyFgf4Cfa12Copies"),
+            "breed_genetic_prior": form.get("breedGeneticPrior"),
+            "age_months": form.get("ageMonths"),
+            "weight_kg": form.get("weightKg"),
         }
-        return [feats[name] for name in FEATURE_ORDER]
+        vec = []
+        for name in FEATURE_ORDER:
+            if name == "sex_M":
+                vec.append(1.0 if sex_raw[:4].lower() == "male" else 0.0)
+            else:
+                vec.append(_f(raw[name], FEATURE_MEDIANS[name]))
+        supplied = sum(1 for name in BIOMARKER_FEATURES if _present(raw[name]))
+        return vec, supplied / len(BIOMARKER_FEATURES)
 
     # -- public API -----------------------------------------------------------
     def predict(self, form: dict, has_mri: bool = False) -> dict:
+        """Blend the trained model with the clinical heuristic in proportion to
+        how many biomarkers were entered. With none of them filled in the model
+        sees an identical vector every time, so the heuristic — which does read
+        breed, symptoms and neuro grade — carries the result on its own."""
+        heuristic_prob = self._heuristic_pct(form, has_mri)
         if self.model is not None:
             try:
-                return self._predict_model(form)
+                model_prob, coverage = self._predict_model(form)
             except Exception as exc:  # noqa: BLE001
                 log.warning("Model inference failed (%s); using heuristic.", exc)
-        return self._predict_heuristic(form, has_mri)
+            else:
+                if coverage > 0:
+                    prob = int(round(
+                        coverage * model_prob + (1 - coverage) * heuristic_prob
+                    ))
+                    source = "model" if coverage >= 1 else "blend"
+                    return self._result(self._level_from_prob(prob), prob, source)
+        return self._result(
+            self._level_from_prob(heuristic_prob), heuristic_prob, "heuristic"
+        )
 
-    def _predict_model(self, form: dict) -> dict:
-        vec = np.array([self._build_features(form)], dtype=float)
+    def _predict_model(self, form: dict) -> tuple[int, float]:
+        vec_list, coverage = self._build_features(form)
+        vec = np.array([vec_list], dtype=float)
         n_expected = getattr(self.model, "n_features_in_", vec.shape[1])
         if vec.shape[1] != n_expected:
             raise ValueError(
@@ -161,12 +224,7 @@ class Predictor:
                 f"model expects {n_expected}"
             )
         proba = self.model.predict_proba(vec)[0]
-        classes = list(self.model.classes_)
-        pred_level = _class_to_level(classes[int(np.argmax(proba))])
-        prob = self._gauge_pct(proba, classes)
-        if pred_level is None:  # unknown labels -> bin the gauge value
-            pred_level = self._level_from_prob(prob)
-        return self._result(pred_level, prob, "model")
+        return self._gauge_pct(proba, list(self.model.classes_)), coverage
 
     @staticmethod
     def _gauge_pct(proba, classes) -> int:
@@ -180,9 +238,8 @@ class Predictor:
         return int(round(float(np.dot(proba, weights)) * 100))
 
     # -- heuristic fallback (mirrors frontend computeRisk) --------------------
-    def _predict_heuristic(self, form: dict, has_mri: bool) -> dict:
-        prob = max(4, min(97, round(self._heuristic_prob(form, has_mri))))
-        return self._result(self._level_from_prob(prob), prob, "heuristic")
+    def _heuristic_pct(self, form: dict, has_mri: bool) -> int:
+        return int(max(4, min(97, round(self._heuristic_prob(form, has_mri)))))
 
     def _heuristic_prob(self, f: dict, has_mri: bool) -> float:
         score = 8.0
