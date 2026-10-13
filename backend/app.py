@@ -35,10 +35,29 @@ def create_app(config_object=Config):
     app.register_blueprint(predict_bp)
     app.register_blueprint(chat_bp)
 
-    # Import models so create_all sees them, then create tables.
+    # Import models so create_all sees them, then create tables. A transient
+    # database outage here must not be fatal: under gunicorn this runs during
+    # the master's import, so an exception kills the process and the platform
+    # restarts it into the same failure. Log and boot instead -- /api/health
+    # stays reachable (reporting db_ready) and the tables get created on the
+    # next boot, while individual DB-backed requests surface their own errors.
+    db_ready = True
+    db_error = None
     with app.app_context():
         import models  # noqa: F401
-        db.create_all()
+        try:
+            db.create_all()
+        except Exception as exc:  # noqa: BLE001 - boot must not depend on the DB
+            db_ready = False
+            db_error = str(exc)
+            logging.warning("db.create_all() failed at boot (%s); continuing.", exc)
+
+        # Drop any connection create_all() left in the pool. Gunicorn runs with
+        # --preload, so everything above happens in the master before forking;
+        # a pooled socket inherited across fork would be shared by two
+        # processes, which corrupts the protocol stream. Disposing here forces
+        # each worker to open its own connections after the fork.
+        db.engine.dispose()
 
     @app.get("/api/health")
     def health():
@@ -47,6 +66,8 @@ def create_app(config_object=Config):
             "model_mode": app.predictor.mode,
             "model_error": app.predictor.load_error,
             "groq_configured": bool(app.config["GROQ_API_KEY"]),
+            "db_ready": db_ready,
+            "db_error": db_error,
         })
 
     @app.get("/")

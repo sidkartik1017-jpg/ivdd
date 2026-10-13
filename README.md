@@ -95,7 +95,14 @@ The frontend still runs with `npm run dev` (or deploy it to Vercel and point
    - `DATABASE_URL` — your Neon Postgres URL (`…?sslmode=require`)
    - `GROQ_API_KEY` — for the live chatbot
    - `CORS_ORIGINS` — your deployed frontend origin, e.g. `https://your-frontend.vercel.app`
-5. Deploy. Check `https://<your-service>.code.run/api/health`.
+5. **Resources:** give the service at least **512 MB** of memory. scikit-learn
+   and numpy cost ~150–250 MB resident just to import, before the model is
+   loaded. Below that the container is OOM-killed and restarts in a loop, which
+   surfaces in the browser as a *CORS* error — the platform proxy returns 503
+   without CORS headers because nothing is listening behind it.
+6. Deploy. Check `https://<your-service>.code.run/api/health`. It reports
+   `model_mode` and `db_ready`, so a healthy response with `db_ready: false`
+   points at `DATABASE_URL` rather than at the app.
 
 Then set `NEXT_PUBLIC_API_URL` on the frontend to the Northflank service URL.
 
